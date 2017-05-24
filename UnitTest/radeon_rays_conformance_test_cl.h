@@ -526,6 +526,129 @@ TEST_F(ApiConformanceCL, DISABLED_CornellBox_10000RaysRandom_ClosestHit_Events_B
     EXPECT_NO_THROW(apigpu_->DeleteBuffer(isect_buffer_gpu));
 }
 
+TEST_F(ApiConformanceCL, CornellBox_1000RaysRandom_Reproduce)
+{
+    int const kNumRays = 1000;
+    int const kNumToReproduce = 10;
+    float const kEpsilon = 0.00001f;
+
+    ray r_brute[kNumRays];
+
+    // generate some random vectors
+    for (int i = 0; i < kNumRays; ++i)
+    {
+        r_brute[i].o = float3(rand_float() * 3.f - 1.5f, rand_float() * 3.f - 1.5f, rand_float() * 3.f - 1.5f, 1000.f);
+        r_brute[i].d = normalize(float3(rand_float(), rand_float(), rand_float()));
+    }
+
+    EXPECT_NO_THROW(apicpu_->Commit());
+    EXPECT_NO_THROW(apigpu_->Commit());
+
+    auto ray_buffer_cpu = apicpu_->CreateBuffer(kNumRays * sizeof(ray), nullptr);
+    auto isect_buffer_cpu = apicpu_->CreateBuffer(kNumRays * sizeof(Intersection), nullptr);
+
+    auto ray_buffer_gpu = apigpu_->CreateBuffer(kNumRays * sizeof(ray), nullptr);
+    auto isect_buffer_gpu = apigpu_->CreateBuffer(kNumRays * sizeof(Intersection), nullptr);
+
+    ray* r_cpu = nullptr;
+    ray* r_gpu = nullptr;
+
+    Event* egpu, *ecpu;
+    EXPECT_NO_THROW(apicpu_->MapBuffer(ray_buffer_cpu, kMapWrite, 0, kNumRays * sizeof(ray), (void**)&r_cpu, &ecpu));
+    EXPECT_NO_THROW(apigpu_->MapBuffer(ray_buffer_gpu, kMapWrite, 0, kNumRays * sizeof(ray), (void**)&r_gpu, &egpu));
+    ecpu->Wait(); apicpu_->DeleteEvent(ecpu);
+    egpu->Wait(); apigpu_->DeleteEvent(egpu);
+
+    for (int i = 0; i<kNumRays; ++i)
+    {
+        r_gpu[i].o = r_cpu[i].o = r_brute[i].o;
+        r_gpu[i].d = r_cpu[i].d = r_brute[i].d;
+        r_gpu[i].SetActive(true);
+        r_cpu[i].SetActive(true);
+        r_gpu[i].SetMask(0xFFFFFFFF);
+        r_cpu[i].SetMask(0xFFFFFFFF);
+    }
+
+    EXPECT_NO_THROW(apicpu_->UnmapBuffer(ray_buffer_cpu, r_cpu, &ecpu));
+    EXPECT_NO_THROW(apigpu_->UnmapBuffer(ray_buffer_gpu, r_gpu, &egpu));
+    ecpu->Wait(); apicpu_->DeleteEvent(ecpu);
+    egpu->Wait(); apigpu_->DeleteEvent(egpu);
+
+    //data to compare with
+    Intersection isect_gold_cpu[kNumRays];
+    Intersection isect_gold_gpu[kNumRays];
+
+    for (int i = 0; i < kNumToReproduce; ++i)
+    {
+        // Intersect
+        Event* cpu_event = nullptr;
+        Event* gpu_event = nullptr;
+        EXPECT_NO_THROW(apicpu_->QueryIntersection(ray_buffer_cpu, kNumRays, isect_buffer_cpu, nullptr, &cpu_event));
+        EXPECT_NO_THROW(apigpu_->QueryIntersection(ray_buffer_gpu, kNumRays, isect_buffer_gpu, nullptr, &gpu_event));
+
+        EXPECT_NE(cpu_event, nullptr);
+        EXPECT_NE(gpu_event, nullptr);
+
+        EXPECT_NO_THROW(cpu_event->Complete());
+        EXPECT_NO_THROW(cpu_event->Wait());
+
+        EXPECT_NO_THROW(gpu_event->Complete());
+        EXPECT_NO_THROW(gpu_event->Wait());
+
+        Intersection* isect_cpu = nullptr;
+        Intersection* isect_gpu = nullptr;
+    
+
+
+        EXPECT_NO_THROW(apicpu_->MapBuffer(isect_buffer_cpu, kMapRead, 0, kNumRays * sizeof(Intersection), (void**)&isect_cpu, &ecpu));
+        EXPECT_NO_THROW(apigpu_->MapBuffer(isect_buffer_gpu, kMapRead, 0, kNumRays * sizeof(Intersection), (void**)&isect_gpu, &egpu));
+        ecpu->Wait(); apicpu_->DeleteEvent(ecpu);
+        egpu->Wait(); apigpu_->DeleteEvent(egpu);
+
+        //initialize gold
+        if (i == 0)
+        {
+            memcpy(isect_gold_cpu, isect_cpu, kNumRays * sizeof(Intersection));
+            memcpy(isect_gold_gpu, isect_gpu, kNumRays * sizeof(Intersection));
+        }
+        else
+        {
+            //compare with gold
+            for (int j = 0; j < kNumRays; ++j)
+            {
+                EXPECT_EQ(isect_gold_cpu[j].padding0, isect_cpu[j].padding0);
+                EXPECT_EQ(isect_gold_cpu[j].padding1, isect_cpu[j].padding1);
+                EXPECT_EQ(isect_gold_cpu[j].primid, isect_cpu[j].primid);
+                EXPECT_EQ(isect_gold_cpu[j].shapeid, isect_cpu[j].shapeid);
+                EXPECT_TRUE((isect_gold_cpu[j].uvwt - isect_cpu[j].uvwt).sqnorm() < kEpsilon);
+                
+                EXPECT_EQ(isect_gold_gpu[j].padding0, isect_gpu[j].padding0);
+                EXPECT_EQ(isect_gold_gpu[j].padding1, isect_gpu[j].padding1);
+                EXPECT_EQ(isect_gold_gpu[j].primid, isect_gpu[j].primid);
+                EXPECT_EQ(isect_gold_gpu[j].shapeid, isect_gpu[j].shapeid);
+                EXPECT_TRUE((isect_gold_gpu[j].uvwt - isect_gpu[j].uvwt).sqnorm() < kEpsilon);
+            }
+        }
+        EXPECT_NO_THROW(apicpu_->UnmapBuffer(isect_buffer_cpu, isect_cpu, &ecpu));
+        EXPECT_NO_THROW(apigpu_->UnmapBuffer(isect_buffer_gpu, isect_gpu, &egpu));
+        ecpu->Wait();
+        egpu->Wait();
+
+        //cleanup
+        EXPECT_NO_THROW(apicpu_->DeleteEvent(cpu_event));
+        EXPECT_NO_THROW(apigpu_->DeleteEvent(gpu_event));
+        EXPECT_NO_THROW(apicpu_->DeleteEvent(ecpu));
+        EXPECT_NO_THROW(apigpu_->DeleteEvent(egpu));
+    }
+
+    //cleanup
+    EXPECT_NO_THROW(apicpu_->DeleteBuffer(ray_buffer_cpu));
+    EXPECT_NO_THROW(apigpu_->DeleteBuffer(ray_buffer_gpu));
+    EXPECT_NO_THROW(apicpu_->DeleteBuffer(isect_buffer_cpu));
+    EXPECT_NO_THROW(apigpu_->DeleteBuffer(isect_buffer_gpu));
+}
+
+
 
 inline void ApiConformanceCL::ExpectClosestIntersectionOk(const Intersection& expected, const Intersection& test) const
 {
